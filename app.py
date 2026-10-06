@@ -69,6 +69,17 @@ def init_db():
                analysis TEXT NOT NULL
            )"""
     )
+    db.execute(
+        """CREATE TABLE IF NOT EXISTS flights(
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               release_seq INTEGER NOT NULL,
+               departure_time TEXT NOT NULL,
+               route TEXT NOT NULL,
+               analysis TEXT NOT NULL,
+               created_at TEXT NOT NULL,
+               ended_at TEXT
+           )"""
+    )
     if db.execute("SELECT 1 FROM kv WHERE k='state'").fetchone() is None:
         db.execute(
             "INSERT INTO kv(k,v) VALUES('state',?)",
@@ -301,6 +312,19 @@ def release_dict(row):
         "createdAt": row["created_at"],
         "state": json.loads(row["state"]),
         "analysis": json.loads(row["analysis"]),
+    }
+
+
+def flight_dict(row):
+    """航次：航次编号、发布号、起飞时刻、航线快照（已替换起飞时刻）与结束时刻。"""
+    return {
+        "id": row["id"],
+        "releaseSeq": row["release_seq"],
+        "departureTime": row["departure_time"],
+        "route": json.loads(row["route"]),
+        "createdAt": row["created_at"],
+        "endedAt": row["ended_at"],
+        "open": row["ended_at"] is None,
     }
 
 
@@ -722,10 +746,12 @@ def submit_nfz_approval():
     """已发布航线的禁飞区变更核准。
 
     提交 {nfzs, workspaceRev, releaseSeq}：把候选禁飞区与最新发布快照中的
-    航线组合审查，全部检查在单个 IMMEDIATE 事务内完成。审查报错、有冲突
-    或任一号已变化时整体回滚，工作区与已发布内容均不变（草稿可修改后
-    重新提交）；通过时仅原子替换工作区禁飞区并递增修订号，最新工作区
-    航线与发布快照保持不动。
+    航线组合审查，并用候选禁飞区逐一复核所有未结束航次（含旧发布的航次，
+    以其登记时保存的航线快照与起飞时刻为准）；全部检查在单个 IMMEDIATE
+    事务内完成。审查报错、发布航线或任一未结束航次有冲突、或任一号已变化
+    时整体回滚，草稿、工作区与已发布内容均不变（草稿可修改后重新提交）；
+    通过时仅原子替换工作区禁飞区并递增修订号，最新工作区航线与发布快照
+    保持不动。已结束的航次不再阻拦核准。
     """
     body = request.get_json(force=True, silent=True) or {}
     nfzs = body.get("nfzs")
@@ -773,6 +799,34 @@ def submit_nfz_approval():
                             "entries": result["entries"],
                             "first": result["first"]}), 409
 
+        # 候选禁飞区 ∩ 所有未结束航次（含旧发布的航次）：以各航次登记时
+        # 保存的航线快照（已含其起飞时刻）逐一复核；任一冲突即整体回滚。
+        # 与航次登记/结束同处 IMMEDIATE 事务序列，交错提交不会漏检。
+        open_flights = db.execute(
+            "SELECT * FROM flights WHERE ended_at IS NULL ORDER BY id"
+        ).fetchall()
+        flight_conflicts = []
+        for frow in open_flights:
+            fresult = analyze({"route": json.loads(frow["route"]), "nfzs": nfzs})
+            if fresult["errors"]:
+                db.rollback()
+                return jsonify({"ok": False, "reason": "analysis_errors",
+                                "error": f"航次 #{frow['id']} 复核存在错误，核准未通过",
+                                "errors": fresult["errors"]}), 400
+            if fresult["entries"]:
+                flight_conflicts.append({
+                    "flight": {"id": frow["id"],
+                               "releaseSeq": frow["release_seq"],
+                               "departureTime": frow["departure_time"]},
+                    "entries": fresult["entries"],
+                    "first": fresult["first"],
+                })
+        if flight_conflicts:
+            db.rollback()
+            return jsonify({"ok": False, "reason": "flight_conflicts",
+                            "error": f"候选禁飞区与 {len(flight_conflicts)} 个未结束航次冲突，核准未通过",
+                            "flights": flight_conflicts}), 409
+
         # 通过：仅替换工作区禁飞区（保留最新工作区航线），修订号 +1
         ws_row = db.execute("SELECT v FROM kv WHERE k='state'").fetchone()
         ws_state = json.loads(ws_row["v"]) if ws_row else {}
@@ -788,6 +842,118 @@ def submit_nfz_approval():
         raise
     return jsonify({"ok": True, "rev": workspace_rev(db),
                     "releaseSeq": current_release_seq(db)})
+
+
+# ---------------------------------------------------------------- 航次
+@app.get("/api/flights")
+def list_flights():
+    """全部航次（新的在前），供页面查询与结束。"""
+    rows = get_db().execute(
+        "SELECT * FROM flights ORDER BY id DESC"
+    ).fetchall()
+    return jsonify([flight_dict(r) for r in rows])
+
+
+@app.post("/api/flights")
+def register_flight():
+    """航次登记：对当前发布号登记一次执行。
+
+    提交 {departureTime, releaseSeq}：取最新发布快照中的航线，替换起飞时刻，
+    与工作区已核准禁飞区重新审查；全部检查在单个 IMMEDIATE 事务内完成。
+    无发布、发布号已变、时刻无效、审查报错或有冲突时拒绝且不留记录；
+    安全时落库航次编号、发布号、起飞时刻与航线快照。
+    """
+    body = request.get_json(force=True, silent=True) or {}
+    dep_raw = body.get("departureTime")
+    dep = parse_dt(dep_raw) if isinstance(dep_raw, str) else None
+    try:
+        rel_seq = int(body.get("releaseSeq"))
+    except (TypeError, ValueError):
+        rel_seq = None
+    if rel_seq is None:
+        return jsonify({"ok": False, "reason": "missing_fields",
+                        "error": "必须提交整数 releaseSeq"}), 400
+    if dep is None:
+        return jsonify({"ok": False, "reason": "invalid_time",
+                        "error": "起飞时刻缺失或格式错误"}), 400
+
+    db = get_db()
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        rel_row = db.execute(
+            "SELECT state FROM releases ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if rel_row is None:
+            db.rollback()
+            return jsonify({"ok": False, "reason": "no_release",
+                            "error": "尚无已发布航线，无法登记航次"}), 409
+
+        # 乐观并发：提交的发布号须与当前已发布号一致
+        cur_seq = current_release_seq(db)
+        if rel_seq != cur_seq:
+            db.rollback()
+            return jsonify({"ok": False, "reason": "stale",
+                            "error": "已发布号已变化，请刷新后重试",
+                            "details": {"releaseSeq": {"expected": rel_seq,
+                                                       "actual": cur_seq}}}), 409
+
+        # 发布快照航线替换起飞时刻 ∩ 工作区已核准禁飞区，重新审查
+        released = json.loads(rel_row["state"])
+        route = dict(released.get("route") or {})
+        route["departureTime"] = fmt_dt(dep)
+        ws_row = db.execute("SELECT v FROM kv WHERE k='state'").fetchone()
+        ws_state = json.loads(ws_row["v"]) if ws_row else {}
+        result = analyze({"route": route, "nfzs": ws_state.get("nfzs") or []})
+        if result["errors"]:
+            db.rollback()
+            return jsonify({"ok": False, "reason": "analysis_errors",
+                            "error": "审查存在错误，航次未登记",
+                            "errors": result["errors"]}), 400
+        if result["entries"]:
+            db.rollback()
+            return jsonify({"ok": False, "reason": "analysis_conflicts",
+                            "error": f"审查发现 {len(result['entries'])} 处冲突，航次未登记",
+                            "entries": result["entries"],
+                            "first": result["first"]}), 409
+
+        created = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cur = db.execute(
+            "INSERT INTO flights(release_seq,departure_time,route,analysis,created_at)"
+            " VALUES(?,?,?,?,?)",
+            (rel_seq, fmt_dt(dep), json.dumps(route, ensure_ascii=False),
+             json.dumps(result, ensure_ascii=False), created),
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    row = db.execute("SELECT * FROM flights WHERE id=?", (cur.lastrowid,)).fetchone()
+    return jsonify({"ok": True, "flight": flight_dict(row)})
+
+
+@app.post("/api/flights/<int:fid>/end")
+def end_flight(fid):
+    """结束航次：标记 ended_at；结束后该航次不再阻拦禁飞区核准。"""
+    db = get_db()
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        row = db.execute("SELECT * FROM flights WHERE id=?", (fid,)).fetchone()
+        if row is None:
+            db.rollback()
+            return jsonify({"ok": False, "reason": "flight_not_found",
+                            "error": f"航次 {fid} 不存在"}), 404
+        if row["ended_at"] is not None:
+            db.rollback()
+            return jsonify({"ok": False, "reason": "already_ended",
+                            "error": f"航次 {fid} 已结束"}), 409
+        ended = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        db.execute("UPDATE flights SET ended_at=? WHERE id=?", (ended, fid))
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    row = db.execute("SELECT * FROM flights WHERE id=?", (fid,)).fetchone()
+    return jsonify({"ok": True, "flight": flight_dict(row)})
 
 
 init_db()
