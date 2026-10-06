@@ -16,6 +16,11 @@ let analyzeTimer = null, saveTimer = null;
 let panelDirty = true;
 let workspaceRev = 0;      // 当前工作区修订号（GET 响应头 / PUT 响应体维护）
 let currentRelease = null; // 当前发布（GET /api/release）
+let voyages = [];          // 航次列表（GET /api/voyages，新登记在前）
+// 航次起飞时刻输入框草稿：随当前发布号切换预填为该发布快照的起飞时刻；
+// 用户录入后保留其值，发布号变化才重新预填
+let voyageDepSeq = null;
+let voyageDepDraft = "";
 // 发布状态机：loading=尚未读到发布状态（页面可编辑但禁止一切工作区写请求）；
 // published=确认已有发布（禁飞区只存草稿、航线条件保存）；
 // none=确认从无发布（沿用原无条件自动保存）；error=读取失败（保留编辑、
@@ -994,6 +999,7 @@ async function loadRelease() {
     if (typeof r.workspaceRev === "number") workspaceRev = r.workspaceRev;
     renderRelease();
     renderNfzDraft();
+    renderVoyages();
     // 两次读取之间修订号已变：先取回最新工作区（合入他页已核准禁飞区；
     // 仅他页改航线则直接采用远端；双方航线都变则走冲突选择流程并暂停自动
     // 保存），完成后再放行写请求门，避免“新修订号 + 编辑前所见旧航线/旧
@@ -1013,6 +1019,7 @@ async function loadRelease() {
     resolveReleaseReady(releaseState);
     renderRelease();
     renderNfzDraft();
+    renderVoyages();
     replayWithheldWrite(false);
   }
 }
@@ -1145,6 +1152,7 @@ async function publishVersion(v) {
       releaseState = "published";
       renderRelease();
       renderNfzDraft(); // 进入“已有发布”状态：此后的禁飞区变更先存草稿
+      loadVoyages();    // 新发布出现后航次登记面板切换到该发布号
       toast(`已发布 #${r.release.seq}（来源：${r.release.sourceVersionName}）`);
     } else {
       if (r.reason === "stale") {
@@ -1196,6 +1204,14 @@ function renderNfzDraft(err) {
       for (const [k, v] of Object.entries(err.details)) {
         const label = k === "workspaceRev" ? "工作区修订号" : "已发布号";
         html += `<div class="entry-line">${label}：读取时 ${v.expected} → 当前 ${v.actual}</div>`;
+      }
+    }
+    // 候选禁飞区与未结束航次（含旧发布航次）冲突：逐个航次展示冲突明细
+    for (const vc of err.voyageConflicts || []) {
+      html += `<div class="error-line">⚠ 航次 #${vc.voyageId}（发布 #${vc.releaseSeq}，起飞 ${fmtTime(vc.departureTime)}）：${vc.entries.length} 处冲突</div>`;
+      for (const e of vc.entries || []) {
+        html += `<div class="entry-line">✈ ${esc(e.nfzName)} · 航段${e.segIndex + 1} ·
+          ${fmtTime(e.enterTime)}→${fmtTime(e.exitTime)} · 高度 ${e.altLow}–${e.altHigh}m</div>`;
       }
     }
   }
@@ -1302,6 +1318,164 @@ function discardNfzDraft() {
   toast("已放弃禁飞区草稿");
 }
 
+// ----------------------------------------------------------- 航次登记
+// 航次以“当前发布号 + 起飞时刻”登记：服务端取该发布快照航线替换起飞时刻，
+// 与工作区已核准禁飞区重新审查，安全时落库航次编号/发布号/起飞时刻/航线快照。
+// 无发布、发布号已变、时刻无效或审查报错/冲突均拒绝且不留记录。
+async function loadVoyages() {
+  let r = null;
+  try {
+    r = await api("/api/voyages");
+  } catch (e) {
+    r = null;
+  }
+  if (r && r.ok) {
+    voyages = r.voyages || [];
+  }
+  renderVoyages();
+}
+
+function renderVoyageRegister(err) {
+  const box = $("#voyageRegisterBox");
+  if (!box) return;
+  let html = "";
+  if (err) {
+    html += `<div class="error-line">⚠ 航次登记被拒绝：${esc(err.error || "未知原因")}</div>`;
+    for (const e of err.errors || []) {
+      html += `<div class="error-line">⚠ ${esc(e.message)}</div>`;
+    }
+    for (const e of err.entries || []) {
+      html += `<div class="entry-line">✈ ${esc(e.nfzName)} · 航段${e.segIndex + 1} ·
+        ${fmtTime(e.enterTime)}→${fmtTime(e.exitTime)} · 高度 ${e.altLow}–${e.altHigh}m</div>`;
+    }
+    if (err.details) {
+      for (const [k, v] of Object.entries(err.details)) {
+        const label = k === "workspaceRev" ? "工作区修订号" : "已发布号";
+        html += `<div class="entry-line">${label}：读取时 ${v.expected} → 当前 ${v.actual}</div>`;
+      }
+    }
+  }
+  if (releaseState === "loading") {
+    html += `<div class="summary">正在确认发布状态…</div>`;
+  } else if (releaseState === "error") {
+    html += `<div class="error-line">⚠ 发布状态读取失败，请刷新页面或在「当前发布」处重试后再登记航次。</div>`;
+  } else if (!currentRelease) {
+    html += `<div class="summary">尚无已发布航线，暂不能登记航次。</div>`;
+  } else {
+    // 发布号变化（含首次出现发布）时预填该发布快照的起飞时刻，之后保留用户草稿
+    if (voyageDepSeq !== currentRelease.seq) {
+      voyageDepSeq = currentRelease.seq;
+      voyageDepDraft = (currentRelease.state && currentRelease.state.route
+        && currentRelease.state.route.departureTime) || "";
+    }
+    html += `<div class="summary">按当前发布 #${currentRelease.seq} 登记：服务端以该发布快照航线替换起飞时刻，与工作区已核准禁飞区重新审查，安全才落库。</div>
+      <div class="form-row" style="margin-top:6px">
+        <label>起飞时刻</label>
+        <input type="datetime-local" id="voyageDep" step="60" style="flex:1;min-width:0"
+               value="${esc(voyageDepDraft)}">
+      </div>
+      <div class="draft-actions">
+        <button id="btnVoyageRegister">登记航次</button>
+      </div>`;
+  }
+  box.innerHTML = html;
+  const dep = $("#voyageDep");
+  if (dep) {
+    dep.oninput = () => { voyageDepDraft = dep.value; };
+    $("#btnVoyageRegister").onclick = submitVoyageRegister;
+  }
+}
+
+function renderVoyageList() {
+  const box = $("#voyageListBox");
+  if (!box) return;
+  if (!voyages.length) {
+    box.innerHTML = `<div class="summary">暂无已登记航次。</div>`;
+    return;
+  }
+  box.innerHTML = voyages.map((v) => {
+    const status = v.open
+      ? `<span class="voyage-open">执行中</span>`
+      : `<span class="voyage-ended">已结束 ${esc(v.endedAt)}</span>`;
+    const btn = v.open
+      ? ` <button data-act="end" data-id="${v.id}" class="minor" style="padding:2px 8px;font-size:11px">结束航次</button>`
+      : "";
+    return `<div class="voyage-item${v.open ? " open" : ""}">
+      <div class="vmeta">
+        <div class="vname">航次 #${v.id} ｜ 发布 #${v.releaseSeq} ${status}</div>
+        <div class="vtime">起飞 ${fmtTime(v.departureTime)} ｜ 登记于 ${esc(v.createdAt)}</div>
+      </div>${btn}
+    </div>`;
+  }).join("");
+  box.querySelectorAll("[data-act='end']").forEach((b) => {
+    b.onclick = () => endVoyage(+b.dataset.id);
+  });
+}
+
+function renderVoyages(err) {
+  const root = $("#voyageBox");
+  if (!root) return;
+  root.innerHTML = `<div id="voyageRegisterBox"></div><div id="voyageListBox" style="margin-top:8px"></div>`;
+  renderVoyageRegister(err);
+  renderVoyageList();
+}
+
+async function submitVoyageRegister() {
+  if (!currentRelease) return;
+  const depVal = voyageDepDraft || "";
+  if (!depVal) {
+    renderVoyages({ error: "请先填写起飞时刻" });
+    return;
+  }
+  const seq = currentRelease.seq;
+  let r;
+  try {
+    r = await api("/api/voyages", {
+      method: "POST",
+      body: JSON.stringify({ releaseSeq: seq, departureTime: depVal }),
+    });
+  } catch (e) {
+    renderVoyages({ error: "登记请求失败：" + e });
+    return;
+  }
+  if (r.ok) {
+    toast(`已登记航次 #${r.voyage.id}（发布 #${r.voyage.releaseSeq}）`);
+    await loadVoyages();
+    return;
+  }
+  if (r.reason === "stale" || r.reason === "no_release") {
+    // 发布号已变化（如他页刚发布）：同步最新发布后再展示拒绝明细
+    try {
+      const cur = await api("/api/release");
+      if (cur && cur.ok) {
+        currentRelease = cur.release;
+        releaseState = cur.release ? "published" : "none";
+        if (typeof cur.workspaceRev === "number") workspaceRev = cur.workspaceRev;
+      }
+    } catch (e) { /* 仍展示下方明细 */ }
+    renderRelease();
+    renderNfzDraft();
+  }
+  renderVoyages(r);
+  toast("航次登记被拒绝：" + (r.error || "未知原因"));
+}
+
+async function endVoyage(id) {
+  let r;
+  try {
+    r = await api(`/api/voyages/${id}/end`, { method: "POST" });
+  } catch (e) {
+    toast("结束航次请求失败：" + e);
+    return;
+  }
+  if (r.ok) {
+    toast(`航次 #${id} 已结束，不再阻拦后续禁飞区核准`);
+    await loadVoyages();
+  } else {
+    toast("结束航次失败：" + (r.error || "未知原因"));
+  }
+}
+
 // ----------------------------------------------------------- 版本
 async function loadVersions() {
   const list = await api("/api/versions");
@@ -1370,5 +1544,6 @@ $("#btnSaveVer").onclick = async () => {
   renderRelease();
   loadVersions();
   loadRelease(); // 不阻塞渲染：其返回前自动保存/核准/发布一律等待，不误写工作区
+  loadVoyages();
   runAnalyze();
 })();

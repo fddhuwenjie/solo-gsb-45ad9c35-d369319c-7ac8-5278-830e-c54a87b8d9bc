@@ -133,6 +133,19 @@ input[type="checkbox"] { accent-color: #2f6df6; }
 }
 .release-card .rel-head { font-weight: 700; font-size: 13px; color: #7fd8ff; margin-bottom: 4px; }
 
+/* 航次 */
+.voyage-item {
+  display: flex; align-items: center; gap: 6px; font-size: 12px;
+  background: #18233a; border: 1px solid #2a3a57; border-radius: 6px;
+  padding: 6px 8px; margin-bottom: 6px;
+}
+.voyage-item.open { border-left: 3px solid #3fcb8c; }
+.voyage-item .vmeta { flex: 1; min-width: 0; }
+.voyage-item .vname { font-weight: 600; }
+.voyage-item .vtime { color: #7e8ea8; font-size: 11px; }
+.voyage-open { color: #3fcb8c; font-weight: 400; font-size: 11px; }
+.voyage-ended { color: #7e8ea8; font-weight: 400; font-size: 11px; }
+
 /* 双页航线冲突 */
 .conflict-card {
   background: rgba(255,77,109,.10); border: 1px solid #ff4d6d;

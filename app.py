@@ -69,6 +69,16 @@ def init_db():
                analysis TEXT NOT NULL
            )"""
     )
+    db.execute(
+        """CREATE TABLE IF NOT EXISTS voyages(
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               release_seq INTEGER NOT NULL,
+               created_at TEXT NOT NULL,
+               departure_time TEXT NOT NULL,
+               route_snapshot TEXT NOT NULL,
+               ended_at TEXT
+           )"""
+    )
     if db.execute("SELECT 1 FROM kv WHERE k='state'").fetchone() is None:
         db.execute(
             "INSERT INTO kv(k,v) VALUES('state',?)",
@@ -301,6 +311,18 @@ def release_dict(row):
         "createdAt": row["created_at"],
         "state": json.loads(row["state"]),
         "analysis": json.loads(row["analysis"]),
+    }
+
+
+def voyage_dict(row):
+    return {
+        "id": row["id"],
+        "releaseSeq": row["release_seq"],
+        "createdAt": row["created_at"],
+        "departureTime": row["departure_time"],
+        "routeSnapshot": json.loads(row["route_snapshot"]),
+        "endedAt": row["ended_at"],
+        "open": row["ended_at"] is None,
     }
 
 
@@ -716,6 +738,113 @@ def publish_release():
     return jsonify({"ok": True, "release": release_dict(row)})
 
 
+# ---------------------------------------------------------------- 航次登记
+@app.get("/api/voyages")
+def list_voyages():
+    """全部航次（新登记在前）：航次编号、发布号、起飞时刻、航线快照与结束时刻。"""
+    rows = get_db().execute(
+        "SELECT * FROM voyages ORDER BY id DESC"
+    ).fetchall()
+    return jsonify({"ok": True, "voyages": [voyage_dict(r) for r in rows]})
+
+
+@app.post("/api/voyages")
+def register_voyage():
+    """按当前发布号登记一次航次执行。
+
+    提交 {releaseSeq, departureTime}：以该发布快照中的航线替换起飞时刻后，
+    与当前工作区已核准禁飞区重新审查；全部检查在单个 IMMEDIATE 事务内完成。
+    无发布、发布号已变、时刻无效或审查报错/冲突时整体回滚，不留航次记录；
+    通过时原子落库航次编号、发布号、起飞时刻与航线快照（工作区与发布不变）。
+    """
+    body = request.get_json(force=True, silent=True) or {}
+    try:
+        rel_seq = int(body.get("releaseSeq"))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "reason": "missing_fields",
+                        "error": "必须提交整数 releaseSeq"}), 400
+    dep_raw = body.get("departureTime")
+    dep = parse_dt(dep_raw)
+    if not isinstance(dep_raw, str) or dep is None:
+        return jsonify({"ok": False, "reason": "invalid_departure_time",
+                        "error": "起飞时刻缺失或格式错误"}), 400
+
+    db = get_db()
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        cur_seq = current_release_seq(db)
+        if cur_seq == 0:
+            db.rollback()
+            return jsonify({"ok": False, "reason": "no_release",
+                            "error": "尚无已发布航线，无法登记航次"}), 409
+        if rel_seq != cur_seq:
+            db.rollback()
+            return jsonify({"ok": False, "reason": "stale",
+                            "error": "已发布号已变化，请刷新后重试",
+                            "details": {"releaseSeq": {"expected": rel_seq, "actual": cur_seq}}}), 409
+
+        rel_row = db.execute(
+            "SELECT state FROM releases WHERE id=?", (cur_seq,)
+        ).fetchone()
+        released = json.loads(rel_row["state"])
+        route = json.loads(json.dumps(released.get("route") or {}, ensure_ascii=False))
+        route["departureTime"] = fmt_dt(dep)
+        ws_row = db.execute("SELECT v FROM kv WHERE k='state'").fetchone()
+        ws_state = json.loads(ws_row["v"]) if ws_row else {}
+        combined = {"route": route, "nfzs": ws_state.get("nfzs") or []}
+
+        result = analyze(combined)
+        if result["errors"]:
+            db.rollback()
+            return jsonify({"ok": False, "reason": "analysis_errors",
+                            "error": "审查存在错误，航次未登记",
+                            "errors": result["errors"]}), 400
+        if result["entries"]:
+            db.rollback()
+            return jsonify({"ok": False, "reason": "analysis_conflicts",
+                            "error": f"审查发现 {len(result['entries'])} 处冲突，航次未登记",
+                            "entries": result["entries"],
+                            "first": result["first"]}), 409
+
+        created = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cur = db.execute(
+            "INSERT INTO voyages(release_seq,created_at,departure_time,route_snapshot)"
+            " VALUES(?,?,?,?)",
+            (cur_seq, created, fmt_dt(dep),
+             json.dumps(route, ensure_ascii=False)),
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    row = db.execute("SELECT * FROM voyages WHERE id=?", (cur.lastrowid,)).fetchone()
+    return jsonify({"ok": True, "voyage": voyage_dict(row)})
+
+
+@app.post("/api/voyages/<int:voyage_id>/end")
+def end_voyage(voyage_id):
+    """结束航次：幂等标记 ended_at；结束后该航次不再阻拦禁飞区核准。"""
+    db = get_db()
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        row = db.execute("SELECT * FROM voyages WHERE id=?", (voyage_id,)).fetchone()
+        if row is None:
+            db.rollback()
+            return jsonify({"ok": False, "reason": "voyage_not_found",
+                            "error": f"航次 {voyage_id} 不存在"}), 404
+        if row["ended_at"] is None:
+            db.execute(
+                "UPDATE voyages SET ended_at=? WHERE id=?",
+                (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), voyage_id),
+            )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    row = db.execute("SELECT * FROM voyages WHERE id=?", (voyage_id,)).fetchone()
+    return jsonify({"ok": True, "voyage": voyage_dict(row)})
+
+
 # ---------------------------------------------------------------- 禁飞区变更核准
 @app.post("/api/nfz-approval")
 def submit_nfz_approval():
@@ -772,6 +901,43 @@ def submit_nfz_approval():
                             "error": f"审查发现 {len(result['entries'])} 处冲突，核准未通过",
                             "entries": result["entries"],
                             "first": result["first"]}), 409
+
+        # 候选禁飞区还须复核所有未结束航次（含旧发布快照登记的航次）：
+        # 任一冲突即驳回并附航次及冲突明细，草稿/工作区/发布快照均不变。
+        # 航次航线快照登记时已验证可审查，理论上不会再出 errors；
+        # 若有则按审查错误驳回，绝不漏检。
+        voyage_conflicts = []
+        voyage_errors = []
+        vrows = db.execute(
+            "SELECT * FROM voyages WHERE ended_at IS NULL ORDER BY id"
+        ).fetchall()
+        for vrow in vrows:
+            vroute = json.loads(vrow["route_snapshot"])
+            vresult = analyze({"route": vroute, "nfzs": nfzs})
+            if vresult["errors"]:
+                voyage_errors.append({"voyageId": vrow["id"],
+                                      "releaseSeq": vrow["release_seq"],
+                                      "errors": vresult["errors"]})
+            if vresult["entries"]:
+                voyage_conflicts.append({
+                    "voyageId": vrow["id"],
+                    "releaseSeq": vrow["release_seq"],
+                    "departureTime": vrow["departure_time"],
+                    "entries": vresult["entries"],
+                    "first": vresult["first"],
+                })
+        if voyage_errors:
+            db.rollback()
+            return jsonify({"ok": False, "reason": "analysis_errors",
+                            "error": "未结束航次复核存在错误，核准未通过",
+                            "voyageErrors": voyage_errors}), 400
+        if voyage_conflicts:
+            db.rollback()
+            total = sum(len(vc["entries"]) for vc in voyage_conflicts)
+            return jsonify({"ok": False, "reason": "voyage_conflicts",
+                            "error": f"候选禁飞区与 {len(voyage_conflicts)} 个未结束航次"
+                                     f"共 {total} 处冲突，核准未通过",
+                            "voyageConflicts": voyage_conflicts}), 409
 
         # 通过：仅替换工作区禁飞区（保留最新工作区航线），修订号 +1
         ws_row = db.execute("SELECT v FROM kv WHERE k='state'").fetchone()

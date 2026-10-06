@@ -6,6 +6,8 @@
 
 对已发布航线，另有**禁飞区变更核准**：已有发布记录时，页面对禁飞区的增删、拖动与修改（含载入版本带来的禁飞区变化）只存为**草稿**，航线编辑仍自动保存、但不顺带落库草稿禁飞区；提交草稿时**不预先保存工作区**——若有在途的航线自动保存则先等它落库以协调顺序与修订号，随后仅以一次核准请求携带**所见工作区修订号与发布号**，服务端把候选禁飞区与**最新发布快照中的航线**组合审查。审查报错、有冲突或任一号已变化时返回原因与冲突/并发明细，**修订号不增加**，草稿保留在本页可继续修改，该提交不改写工作区或已发布内容；通过时仅原子替换工作区禁飞区并递增修订号，最新工作区航线与发布快照保持不动。尚未发布时禁飞区沿用原自动保存。
 
+对已发布航线还可**登记航次**：侧栏输入起飞时刻、按**当前发布号**登记一次执行。服务端在单个事务内取该发布快照中的航线、**仅替换起飞时刻**（航线几何/速度/走廊等全部沿用快照），与**当前工作区已核准禁飞区**重新审查：无发布、提交的发布号已变、时刻无效或审查报错/冲突时一律拒绝且**不留任何航次记录**；安全时原子落库航次编号、发布号、起飞时刻与**航线快照**（工作区与发布快照均不变），供页面查询与结束航次。航次执行期间（未结束）会持续约束禁飞区：提交禁飞区草稿核准时，除原有的“候选禁飞区 ∩ 最新发布快照航线”审查外，还须用候选禁飞区**复核所有未结束航次**——包括登记于旧发布号的航次（各自沿用其自身发布快照航线与登记起飞时刻）；任一冲突即返回 `voyage_conflicts`，附**航次及冲突明细**，草稿、工作区与发布快照均不变。登记航次与提交核准均在单个 `BEGIN IMMEDIATE` 事务内读取“当时全部未结束航次”，SQLite 写事务串行使两类操作交错时**不会漏检任何已登记航次**；航次结束（幂等）后不再阻拦后续核准，但航次记录仍可查询。
+
 为避免多页面互相覆盖，已发布后的航线自动保存会在 `PUT /api/state` 请求头携带所见修订号（`X-Expected-Workspace-Rev`）。他页已先变更时本次保存收到 `409 stale` 且**不写库**，页面取回服务器最新工作区后按三种情况分流，**本页未保存航线、禁飞区草稿与服务器最新航线三者始终同时保留**：
 
 1. **本页航线相对编辑前所见未改**（本页没有待保存的航线改动）：直接采用服务器最新航线与他页已核准禁飞区，不再写库；本页禁飞区草稿保留。
@@ -90,6 +92,7 @@ python app.py          # 同样监听 http://localhost:8000
 | 保存版本 | 顶部输入版本名（可空，自动用时间戳）→「💾 保存版本」；侧栏可载入/删除 |
 | 发布航线 | 版本列表点「发布」：取该版本航线 + 当前工作区禁飞区重新审查，通过后落库；侧栏「当前发布」查看发布号、来源版本与审查结果 |
 | 禁飞区变更核准 | 已有发布时，禁飞区编辑先存为草稿（不落库）；侧栏「提交核准」与发布快照航线组合审查，通过才替换工作区禁飞区；「放弃草稿」还原为已核准内容 |
+| 航次登记 | 侧栏「航次登记」输入起飞时刻，按当前发布号登记；服务端以发布快照航线替换起飞时刻、与已核准禁飞区重审，安全才落库；航次列表可查询、执行中点「结束航次」 |
 | 双页航线冲突 | 两页各改航线、后保存方撞 409 时自动保存暂停：侧栏顶部对比双方航线，可选「加载服务器航线」（草稿保留）或「确认提交本页航线」（最新修订号条件写入，再撞 409 仍保留并重新提示） |
 
 首次启动会写入一条演示数据（4 个航点、3 个禁飞区，含平面+高度+时窗命中、高度不命中、时窗不命中三种样例）。
@@ -106,7 +109,10 @@ python app.py          # 同样监听 http://localhost:8000
 | GET/DELETE | `/api/versions/<id>` | 取出版本快照 / 删除 |
 | GET | `/api/release` | 当前发布（发布号、来源版本、组合状态、审查结果）及当前 `workspaceRev`/`releaseSeq` |
 | POST | `/api/release` | 发布航线 `{versionId, workspaceRev, releaseSeq}`，见下文示例 |
-| POST | `/api/nfz-approval` | 已发布航线的禁飞区变更核准 `{nfzs, workspaceRev, releaseSeq}`，见下文示例 |
+| POST | `/api/nfz-approval` | 已发布航线的禁飞区变更核准 `{nfzs, workspaceRev, releaseSeq}`，见下文示例；除最新发布航线审查外还复核所有未结束航次 |
+| GET | `/api/voyages` | 全部航次（新登记在前）：航次编号、发布号、起飞时刻、航线快照 `routeSnapshot`、结束时刻 `endedAt` 与是否未结束 `open` |
+| POST | `/api/voyages` | 登记航次 `{releaseSeq, departureTime}`，见下文示例 |
+| POST | `/api/voyages/<id>/end` | 结束航次（幂等；不存在 → 404）；结束后不再阻拦禁飞区核准 |
 
 ### 发布航线（POST /api/release）
 
@@ -134,12 +140,31 @@ python app.py          # 同样监听 http://localhost:8000
 | 工作区或已发布号已变化 | 409 | `stale` | `details` 附 `{expected, actual}` 明细 |
 | 尚无发布记录 | 409 | `no_release` | 未发布时禁飞区随工作区自动保存，无需核准 |
 | 审查存在错误 | 400 | `analysis_errors` | `errors` 附错误列表 |
-| 审查存在冲突 | 409 | `analysis_conflicts` | `entries`/`first` 附冲突明细 |
+| 审查存在冲突（最新发布航线） | 409 | `analysis_conflicts` | `entries`/`first` 附冲突明细 |
+| 候选与未结束航次冲突 | 409 | `voyage_conflicts` | `voyageConflicts` 附逐航次的 `voyageId`/`releaseSeq`/`departureTime`/`entries`/`first` |
 | 通过 | 200 | — | `{ok, rev, releaseSeq}`：仅原子替换工作区禁飞区，修订号 +1 |
 
 注意审查用的是**发布快照中的航线**，不是当前工作区航线：工作区航线在发布后被继续编辑不影响核准判定；通过时也只替换工作区禁飞区，最新工作区航线与发布快照都保持不动。
 
 页面提交流程要点：「提交核准」**不会先 PUT 工作区**——页面只在有待发的航线自动保存时先等它落库（保证提交的是所见最新修订号），随后仅发出一次本接口请求；冲突、审查错误或修订号/发布号已变化时修订号都不增加，草稿原样保留并展示上述明细。核准成功后页面只把禁飞区基线更新为候选内容，航线仍是最新工作区航线。
+
+### 航次登记（POST /api/voyages）与结束（POST /api/voyages/&lt;id&gt;/end）
+
+请求体：`releaseSeq`（当前发布号，整数）、`departureTime`（起飞时刻字符串）。服务端在**单个事务**内：核对发布号即当前最新发布（无发布 / 号已变直接拒绝）→ 取该发布**快照航线**并仅把起飞时刻替换为提交值 → 与**当前工作区已核准禁飞区**组合审查。任一环节失败都整体回滚，**不留航次记录、不改工作区与发布快照**：
+
+| 情形 | 状态码 | 响应 `reason` | 说明 |
+|---|---|---|---|
+| 缺少/非整数 `releaseSeq` | 400 | `missing_fields` | — |
+| 起飞时刻缺失/格式错误 | 400 | `invalid_departure_time` | — |
+| 尚无发布记录 | 409 | `no_release` | — |
+| 提交的发布号已非当前发布号 | 409 | `stale` | `details.releaseSeq` 附 `{expected, actual}` |
+| 审查存在错误 | 400 | `analysis_errors` | `errors` 附错误列表 |
+| 与已核准禁飞区冲突 | 409 | `analysis_conflicts` | `entries`/`first` 附冲突明细 |
+| 通过 | 200 | — | `{ok, voyage}`：落库航次，`voyage` 含 `id`（航次编号）、`releaseSeq`、`departureTime`、`routeSnapshot`（替换了起飞时刻的航线快照）、`createdAt`、`endedAt`（未结束为 `null`）、`open: true` |
+
+`GET /api/voyages` 返回 `{ok, voyages:[...]}`（新登记在前），已结束航次 `open:false` 并带 `endedAt`。`POST /api/voyages/<id>/end` 幂等结束航次（重复调用不改变首次结束时刻），结束后该航次不再参与核准复核；航次不存在返回 `404 {"reason":"voyage_not_found"}`。
+
+要点：登记审查用的是**发布快照航线的几何 + 新起飞时刻**——即使同一航线在发布时刻安全，换一个起飞时刻可能落入某已核准禁飞区的生效窗而被拒；登记时工作区航线是什么无关。登记不改变工作区修订号与发布号。新发布出现后，旧航次仍按其自身的发布快照与登记时刻复核，直到被结束。
 
 ### 可执行示例（端口 8000）
 
@@ -182,13 +207,51 @@ curl -s -X POST http://localhost:8000/api/nfz-approval \
   -H 'Content-Type: application/json' \
   -d '{"nfzs":[{"id":"nX","name":"阻断区","vertices":[[250,50],[350,50],[350,150],[250,150]],"minAlt":0,"maxAlt":400,"startTime":"2026-09-24T07:00","endTime":"2026-09-24T09:00","enabled":true}],"workspaceRev":3,"releaseSeq":1}'
 # → 409 {"ok":false,"reason":"analysis_conflicts","entries":[...],"first":{...}}
+
+# ⑧ 航次登记：按当前发布号（①–④后为 1）+ 起飞时刻；服务端以发布 #1 快照
+#    航线替换起飞时刻，与工作区已核准禁飞区（⑤的“远侧限飞区”）重新审查
+curl -s -X POST http://localhost:8000/api/voyages \
+  -H 'Content-Type: application/json' \
+  -d '{"releaseSeq":1,"departureTime":"2026-09-24T08:00"}'
+# → {"ok":true,"voyage":{"id":1,"releaseSeq":1,"departureTime":"2026-09-24T08:00",
+#     "routeSnapshot":{...发布快照航线，起飞时刻已替换...},"endedAt":null,"open":true,...}}
+
+# ⑨ 查询航次（新登记在前；已结束航次带 endedAt、open=false）
+curl -s http://localhost:8000/api/voyages
+# → {"ok":true,"voyages":[{"id":1,...}]}
+
+# ⑩ 航次未结束时，候选禁飞区还要复核该航次：夜间窗对发布快照（08:00）安全，
+#    但若该航次登记为 20:30 起飞就会冲突；此处先再登记一个夜间航次试试——
+#    ⑤核准的“远侧限飞区”无时间窗但不在航线附近，所以 20:30 航次仍可登记：
+curl -s -X POST http://localhost:8000/api/voyages \
+  -H 'Content-Type: application/json' \
+  -d '{"releaseSeq":1,"departureTime":"2026-09-24T20:30"}'
+# → {"ok":true,"voyage":{"id":2,...}}
+#    再提交夜间窗候选：发布快照航线 08:00 不冲突，但航次 #2（20:30）冲突 →
+curl -s -X POST http://localhost:8000/api/nfz-approval \
+  -H 'Content-Type: application/json' \
+  -d '{"nfzs":[{"id":"nN","name":"夜间管控区","vertices":[[250,50],[350,50],[350,150],[250,150]],"minAlt":0,"maxAlt":400,"startTime":"2026-09-24T20:00","endTime":"2026-09-24T21:00","enabled":true}],"workspaceRev":3,"releaseSeq":1}'
+# → 409 {"ok":false,"reason":"voyage_conflicts","voyageConflicts":[{"voyageId":2,"releaseSeq":1,"departureTime":"2026-09-24T20:30","entries":[...],"first":{...}}]}
+#    草稿、工作区（仍是“远侧限飞区”）、发布快照均不变
+
+# ⑪ 结束航次 #2（幂等）后再提交同一候选 → 通过（08:00 的发布快照与航次 #1 都不冲突）
+curl -s -X POST http://localhost:8000/api/voyages/2/end
+# → {"ok":true,"voyage":{"id":2,"open":false,"endedAt":"..."}}
+curl -s -X POST http://localhost:8000/api/nfz-approval \
+  -H 'Content-Type: application/json' \
+  -d '{"nfzs":[{"id":"nN","name":"夜间管控区","vertices":[[250,50],[350,50],[350,150],[250,150]],"minAlt":0,"maxAlt":400,"startTime":"2026-09-24T20:00","endTime":"2026-09-24T21:00","enabled":true}],"workspaceRev":3,"releaseSeq":1}'
+# → {"ok":true,"rev":4,"releaseSeq":1}
+
+# 时刻无效 / 发布号已变 / 无发布 → 拒绝且不留记录：
+#   400 {"reason":"invalid_departure_time"} / 409 {"reason":"stale","details":{...}}
+#   / 409 {"reason":"no_release"}
 ```
 
 > 提示：工作区再被编辑后 `workspaceRev` 会变化、每次成功发布后 `releaseSeq` 会递增；用旧值重新发布或提交核准会得到 `409 {"reason":"stale","details":...}`，先 `GET /api/release` 取最新两个号再重试即可。
 
 ## 回归测试
 
-判定口径（含凹形禁飞区空隙误报、多部件两段命中、时窗截短见证点移动、线/点/时窗端点擦碰）由 `tests/test_analyze.py` 覆盖；发布航线（组合审查、递增发布号、乐观并发、失败回滚、发布不可变）由 `tests/test_release.py` 覆盖；禁飞区变更核准（发布快照航线组合审查、仅替换工作区禁飞区、乐观并发、失败不改写）由 `tests/test_nfz_approval.py` 覆盖；页面提交（核准不预存工作区、相邻保存与核准的修订号协调、条件 PUT 409 合流）与**双页面交错**（他页核准后本页保存不得覆盖已核准禁飞区、**两页各改航线时后保存方 409 后不得换新号整份覆盖、双方航线并列可选、加载远端保留禁飞区草稿、确认提交用最新修订号条件写入且再撞 409 仍保留本页编辑**、在途保存与核准相邻时未解决冲突不得继续核准、发布号变化拒绝、快照不动）以及**启动请求交错**（`GET /api/state → GET /api/release` 期间他页改航线/核准禁飞区并推进修订号：协调再读失败时不得用新修订号把旧航线/旧禁飞区整份写回、保留草稿并阻断自动保存及相邻核准/发布、重试取回后三分支分流——远端未变按最新修订号条件保存、仅他页改航线直接采用远端不写库、双方都改才进冲突选择；另含“新号配旧内容会被服务端 200 接受”的危害固定用例）由 `tests/test_workspace_concurrency.py` 覆盖，均仅用标准库 `unittest`：
+判定口径（含凹形禁飞区空隙误报、多部件两段命中、时窗截短见证点移动、线/点/时窗端点擦碰）由 `tests/test_analyze.py` 覆盖；发布航线（组合审查、递增发布号、乐观并发、失败回滚、发布不可变）由 `tests/test_release.py` 覆盖；禁飞区变更核准（发布快照航线组合审查、仅替换工作区禁飞区、乐观并发、失败不改写）由 `tests/test_nfz_approval.py` 覆盖；**航次登记/结束与核准对航次的复核**（快照航线替换起飞时刻后与已核准禁飞区重审、无发布/号变/时刻无效/报错/冲突均拒绝不留记录、航次快照与列表、结束幂等与 404、未结束航次——含旧发布航次——阻拦核准并逐航次附冲突明细、结束后放行、登记与核准交错不漏检）由 `tests/test_voyages.py` 覆盖；页面提交（核准不预存工作区、相邻保存与核准的修订号协调、条件 PUT 409 合流）与**双页面交错**（他页核准后本页保存不得覆盖已核准禁飞区、**两页各改航线时后保存方 409 后不得换新号整份覆盖、双方航线并列可选、加载远端保留禁飞区草稿、确认提交用最新修订号条件写入且再撞 409 仍保留本页编辑**、在途保存与核准相邻时未解决冲突不得继续核准、发布号变化拒绝、快照不动）以及**启动请求交错**（`GET /api/state → GET /api/release` 期间他页改航线/核准禁飞区并推进修订号：协调再读失败时不得用新修订号把旧航线/旧禁飞区整份写回、保留草稿并阻断自动保存及相邻核准/发布、重试取回后三分支分流——远端未变按最新修订号条件保存、仅他页改航线直接采用远端不写库、双方都改才进冲突选择；另含“新号配旧内容会被服务端 200 接受”的危害固定用例）由 `tests/test_workspace_concurrency.py` 覆盖，均仅用标准库 `unittest`：
 
 ```bash
 python3 -m unittest discover -s tests        # 需已 pip install -r requirements.txt
@@ -197,13 +260,14 @@ python3 -m unittest discover -s tests        # 需已 pip install -r requirement
 ## 目录结构
 
 ```
-app.py                 # Flask 后端：SQLite、时窗/高度/平面冲突计算（Shapely）、发布航线、禁飞区变更核准
+app.py                 # Flask 后端：SQLite、时窗/高度/平面冲突计算（Shapely）、发布航线、禁飞区变更核准、航次登记/结束
 tests/test_analyze.py  # 判定口径回归（凹形空隙、两段命中、时窗截断、擦碰）
 tests/test_release.py  # 发布航线回归（组合审查、并发回退、不可变性）
 tests/test_nfz_approval.py  # 禁飞区变更核准回归（快照航线审查、草稿提交、并发回退）
+tests/test_voyages.py   # 航次回归（快照换时刻登记、拒绝不留记录、未结束航次阻拦核准、结束放行、交错不漏检）
 tests/test_workspace_concurrency.py  # 页面提交、双页面交错与启动请求交错回归（核准不预存、条件 PUT、修订号协调、协调失败阻断）
 templates/index.html   # 单页布局
-static/app.js          # 原生 JS：SVG 渲染、拖动、绘制、重算、版本、发布、禁飞区草稿
+static/app.js          # 原生 JS：SVG 渲染、拖动、绘制、重算、版本、发布、禁飞区草稿、航次登记
 static/style.css       # 样式
 Dockerfile             # python:3.12-slim + gunicorn
 docker-compose.yml     # 一条命令启动，端口 8000，卷持久化
